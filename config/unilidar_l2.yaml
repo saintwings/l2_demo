@@ -1,0 +1,80 @@
+extrinsics:
+  # imu <- lidar (w,x,y,z)
+  q_il: [1.0, 0.0, 0.0, 0.0]
+  p_il: [-0.007698, -0.014655, 0.00667]
+
+imu_noise:
+  acc_n: 0.2
+  gyr_n: 0.02
+  acc_w: 0.001
+  gyr_w: 0.0001
+
+ikd_tree:
+  leaf_size: 0.20           # meters
+  local_window_xyz: [60.0, 60.0, 10.0]
+
+timing:
+  lidar_time_offset: 0.0    # seconds (lidar clock relative to IMU)
+
+deskew:
+  use_translation: false       # false = rotation-only deskew
+  max_point_dt: 0.25          # max time span of points in a scan [s]
+  downsample_stride: 1        # stride for visualization streaming
+  ws_port: 8081                # set 0 to disable WebSocket streaming
+  save_ply: true              # if true, save first deskewed frame as PLY
+  ply_path: "deskew_first_frame.ply"
+
+# Object detection runtime options
+object_detection:
+  voxel_size: 0.05
+  remove_ground: true
+  ground_threshold: 0.10
+  stream_ground_points: true
+  ground_color_rgb: [255, 255, 255]   # optional default color for ground in viz
+  # Accumulate multiple frames to mitigate partial coverage from swing angle
+  accumulate_frames: 3
+  accumulate_seconds: 0.3        # retain points for this time window
+  max_accumulated_points: 120000  # safety cap to avoid overgrowth
+  cluster_tolerance: 0.30
+  min_cluster_size: 1
+  max_cluster_size: 500
+  # clustering: euclidean or dbscan
+  clustering_method: dbscan    # euclidean | dbscan
+  dbscan_eps: 0.1                # m (used when clustering_method: dbscan)
+  dbscan_min_points: 20            # min points to form a dense region
+  min_object_volume: 0.005
+  max_object_volume: 5.0
+  max_detection_range: 2.0
+  enable_aoi: true
+  aoi_min_x: -1.0
+  aoi_max_x: 1.0
+  aoi_min_y: -1.0
+  aoi_max_y: 1.0
+  aoi_min_z: -1.0
+  aoi_max_z: 1.0
+  enable_radial_filter: false
+  radial_min_range: 0.5
+  radial_max_range: 20.0
+  radial_min_angle: -180.0
+  radial_max_angle: 180.0
+  # Rotate incoming points into IMU/world frame using IMU quaternion (if provided by device)
+  imu_rotate_points: true
+
+  # Simple multi-frame object tracking for stability
+  tracking_enabled: true
+  tracking_max_assoc_dist: 0.8     # meters (center-to-center gating)
+  tracking_alpha: 0.3              # smoothing factor (0..1), higher trusts new meas more
+  tracking_max_missed: 3           # frames allowed to miss before dropping track
+
+  # Windowed accumulation (for object_detection_windowed_live)
+  window:
+    enable_angle_window: true
+    angle_bin_deg: 100.0
+    window_width_deg: 360.0
+    window_overlap_deg: 20.0
+    edge_guard_deg: 10.0
+    enable_time_window: true
+    window_time_s: 0.4
+    window_overlap_s: 0.2
+    max_points: 120000
+

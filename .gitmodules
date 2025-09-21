@@ -1,0 +1,4 @@
+
+[submodule "third_party/unilidar_sdk2"]
+	path = third_party/unilidar_sdk2
+	url = https://github.com/unitreerobotics/unilidar_sdk2.git

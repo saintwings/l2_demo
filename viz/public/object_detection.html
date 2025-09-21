@@ -1,0 +1,736 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Object Detection LiDAR Viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0f14; color:#ddd; font-family: system-ui, sans-serif; }
+  #pane { position:fixed; top:10px; left:10px; z-index:10; background:rgba(0,0,0,0.45); padding:10px 12px; border-radius:12px; backdrop-filter: blur(6px); max-width: 300px; }
+  #pane label { margin-right:8px; }
+  #pane input[type=range] { width:160px; vertical-align: middle; }
+  #pane input[type=checkbox] { margin-right: 5px; }
+  #objectInfo { position:fixed; top:10px; right:10px; z-index:10; background:rgba(0,0,0,0.45); padding:10px 12px; border-radius:12px; backdrop-filter: blur(6px); max-width: 250px; max-height: 400px; overflow-y: auto; }
+  .object-item { margin-bottom: 8px; padding: 5px; background: rgba(255,255,255,0.1); border-radius: 4px; font-size: 12px; }
+  .object-header { font-weight: bold; color: #4fc3f7; }
+  canvas { display:block; }
+  .stats { margin-top: 10px; font-size: 11px; color: #aaa; }
+</style>
+<script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.172/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.172/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+<div id="pane">
+  WS: <span id="ws">connecting…</span><br/>
+  
+  <label><input type="checkbox" id="showPoints" checked> Show Point Cloud</label><br/>
+  <label><input type="checkbox" id="showObjects" checked> Show Objects</label><br/>
+  <label><input type="checkbox" id="showGround" checked> Show Ground</label><br/>
+  <label><input type="checkbox" id="showLabels" checked> Show Object Labels</label><br/>
+  <label><input type="checkbox" id="showAOI" checked> Show Area of Interest</label><br/>
+  <label><input type="checkbox" id="showIMUAxes" checked> Show IMU Axes</label><br/>
+  <label><input type="checkbox" id="showGravityAxes"> Show Gravity Axes</label><br/>
+  <label><input type="checkbox" id="showMountAxes"> Show Mount Axes</label><br/>
+  
+  <div id="pointCloudControls">
+    Color By:
+    <select id="colorBy">
+      <option value="height">Height (Z)</option>
+      <option value="intensity">Intensity</option>
+      <option value="rgb">RGB (from stream)</option>
+    </select>
+    <label>Min <input id="minVal" type="range" min="0" max="1" step="0.01" value="0"></label>
+    <label>Max <input id="maxVal" type="range" min="0" max="1" step="0.01" value="1"></label>
+    <span id="vmin">0.00</span> – <span id="vmax">1.00</span>
+    <br/>
+    Point Size:
+    <input id="ptSize" type="range" min="0.005" max="0.08" step="0.005" value="0.02" />
+  </div>
+  
+  <div class="stats">
+    <div>Frame: <span id="frameId">0</span></div>
+    <div>Objects: <span id="objectCount">0</span></div>
+    <div>Points: <span id="pointCount">0</span></div>
+    <div>FPS: <span id="fps">0</span></div>
+    <div style="margin-top: 5px; padding-top: 5px; border-top: 1px solid #444;">
+      <div>IMU: <span id="imuStatus">Not calibrated</span></div>
+      <div>Motion: <span id="motionStatus">Unknown</span></div>
+      <div>Gravity: <span id="gravityVector">Unknown</span></div>
+      <div>Orientation (RPY): <span id="orientationRPY">0, 0, 0</span>°</div>
+      <div>Tilt: <span id="tiltAngle">0.0</span>°</div>
+    </div>
+  </div>
+</div>
+
+<div id="objectInfo">
+  <div style="font-weight: bold; margin-bottom: 10px;">Detected Objects</div>
+  <div id="objectList">No objects detected</div>
+</div>
+
+<script type="module">
+
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+// CSS2D renderer for labels
+const labelRenderer = new CSS2DRenderer();
+labelRenderer.setSize(innerWidth, innerHeight);
+labelRenderer.domElement.style.position = 'absolute';
+labelRenderer.domElement.style.top = '0px';
+labelRenderer.domElement.style.pointerEvents = 'none';
+document.body.appendChild(labelRenderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0f14);
+scene.rotation.x = -Math.PI /2;
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 2000);
+camera.position.set(6, 6, 6);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0,0,0);
+
+
+
+const gridHelper = new THREE.GridHelper(20, 20, 0x444444, 0x888888);
+gridHelper.rotation.x = Math.PI / 2;
+scene.add(gridHelper);
+scene.add(new THREE.AxesHelper(1.0));
+
+// Point cloud
+const geom = new THREE.BufferGeometry();
+const mat  = new THREE.PointsMaterial({ size: 0.02, vertexColors: true });
+const points = new THREE.Points(geom, mat);
+scene.add(points);
+
+// Ground points cloud (single color)
+const groundGeom = new THREE.BufferGeometry();
+const groundMat = new THREE.PointsMaterial({ size: 0.02, color: new THREE.Color(0x50A0FF) });
+const groundPoints = new THREE.Points(groundGeom, groundMat);
+scene.add(groundPoints);
+
+// Object visualization groups
+const objectGroup = new THREE.Group();
+scene.add(objectGroup);
+
+const labelGroup = new THREE.Group();
+scene.add(labelGroup);
+
+const aoiGroup = new THREE.Group();
+scene.add(aoiGroup);
+
+// IMU axes visualization
+const imuAxesGroup = new THREE.Group();
+const imuAxes = new THREE.AxesHelper(1.5);
+imuAxesGroup.add(imuAxes);
+scene.add(imuAxesGroup);
+
+// Gravity-aligned axes (Z down from gravity, X/Y arbitrary orthonormal)
+const gravityAxesGroup = new THREE.Group();
+const gravityAxes = new THREE.AxesHelper(1.2);
+gravityAxesGroup.add(gravityAxes);
+scene.add(gravityAxesGroup);
+
+// Mount axes (from URL-specified RPY, for comparison)
+const mountAxesGroup = new THREE.Group();
+const mountAxes = new THREE.AxesHelper(1.2);
+mountAxesGroup.add(mountAxes);
+scene.add(mountAxesGroup);
+
+// UI elements
+const wsEl = document.getElementById('ws');
+const colorBySel = document.getElementById('colorBy');
+const minVal = document.getElementById('minVal');
+const maxVal = document.getElementById('maxVal');
+const vmin = document.getElementById('vmin');
+const vmax = document.getElementById('vmax');
+const ptSize = document.getElementById('ptSize');
+const showPoints = document.getElementById('showPoints');
+const showObjects = document.getElementById('showObjects');
+const showLabels = document.getElementById('showLabels');
+const showGround = document.getElementById('showGround');
+const showAOI = document.getElementById('showAOI');
+const showIMUAxes = document.getElementById('showIMUAxes');
+const showGravityAxes = document.getElementById('showGravityAxes');
+const showMountAxes = document.getElementById('showMountAxes');
+const frameIdEl = document.getElementById('frameId');
+const objectCountEl = document.getElementById('objectCount');
+const pointCountEl = document.getElementById('pointCount');
+const fpsEl = document.getElementById('fps');
+const objectListEl = document.getElementById('objectList');
+const imuStatusEl = document.getElementById('imuStatus');
+const motionStatusEl = document.getElementById('motionStatus');
+const gravityVectorEl = document.getElementById('gravityVector');
+const orientationRPYEl = document.getElementById('orientationRPY');
+const tiltEl = document.getElementById('tiltAngle');
+
+// Event handlers
+ptSize.oninput = () => { mat.size = parseFloat(ptSize.value); };
+minVal.oninput = () => { vmin.textContent = parseFloat(minVal.value).toFixed(2); recolor(); };
+maxVal.oninput = () => { vmax.textContent = parseFloat(maxVal.value).toFixed(2); recolor(); };
+colorBySel.onchange = () => recolor();
+showPoints.onchange = () => { points.visible = showPoints.checked; };
+showObjects.onchange = () => { objectGroup.visible = showObjects.checked; };
+showGround.onchange = () => { groundPoints.visible = showGround.checked; };
+showLabels.onchange = () => { labelGroup.visible = showLabels.checked; };
+showAOI.onchange = () => { aoiGroup.visible = showAOI.checked; };
+showIMUAxes.onchange = () => { imuAxesGroup.visible = showIMUAxes.checked; };
+showGravityAxes.onchange = () => { gravityAxesGroup.visible = showGravityAxes.checked; };
+showMountAxes.onchange = () => { mountAxesGroup.visible = showMountAxes.checked; };
+
+window.addEventListener("resize", () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  labelRenderer.setSize(innerWidth, innerHeight);
+});
+
+function animate(){ 
+  requestAnimationFrame(animate); 
+  renderer.render(scene, camera);
+  labelRenderer.render(scene, camera);
+}
+animate();
+
+// State
+let lastPositions = null;
+let lastIntensity = null;
+let lastRGB = null;
+let lastObjects = [];
+let zMin=0, zMax=1, IMin=0, IMax=1;
+let frameCount = 0;
+let lastFrameTime = Date.now();
+let lastImuLogTime = 0;
+
+// AOI/radial config from URL (optional)
+const urlParams = new URLSearchParams(window.location.search);
+const aoiConfig = {
+  enable_aoi: urlParams.get('aoi') === '1' || urlParams.get('aoi') === 'true' || false,
+  aoi_min_x: parseFloat(urlParams.get('aoi_min_x') ?? -10),
+  aoi_max_x: parseFloat(urlParams.get('aoi_max_x') ?? 10),
+  aoi_min_y: parseFloat(urlParams.get('aoi_min_y') ?? -10),
+  aoi_max_y: parseFloat(urlParams.get('aoi_max_y') ?? 10),
+  aoi_min_z: parseFloat(urlParams.get('aoi_min_z') ?? -2),
+  aoi_max_z: parseFloat(urlParams.get('aoi_max_z') ?? 5),
+  enable_radial_filter: urlParams.get('radial') === '1' || urlParams.get('radial') === 'true' || false,
+  radial_min_range: parseFloat(urlParams.get('radial_min_range') ?? 0.5),
+  radial_max_range: parseFloat(urlParams.get('radial_max_range') ?? 20.0),
+  radial_min_angle: parseFloat(urlParams.get('radial_min_angle') ?? -180.0),
+  radial_max_angle: parseFloat(urlParams.get('radial_max_angle') ?? 180.0)
+};
+
+createAOIVisualization(aoiConfig);
+aoiGroup.visible = showAOI.checked;
+imuAxesGroup.visible = showIMUAxes.checked;
+gravityAxesGroup.visible = showGravityAxes.checked;
+mountAxesGroup.visible = showMountAxes.checked;
+
+// Optional mount RPY from URL (degrees)
+const mountRollDeg = parseFloat(urlParams.get('mount_roll_deg') ?? 0);
+const mountPitchDeg = parseFloat(urlParams.get('mount_pitch_deg') ?? 0);
+const mountYawDeg = parseFloat(urlParams.get('mount_yaw_deg') ?? 0);
+const mountFlipZ = (urlParams.get('mount_flip_z') === '1' || urlParams.get('mount_flip_z') === 'true') ? 1 : 0;
+{
+  // Build quaternion from RPY ZYX
+  const r = mountRollDeg * Math.PI/180, p = mountPitchDeg * Math.PI/180, y = mountYawDeg * Math.PI/180;
+  const e = new THREE.Euler(r, p, y, 'ZYX');
+  const q = new THREE.Quaternion().setFromEuler(e);
+  if (mountFlipZ) {
+    const flip = new THREE.Quaternion();
+    flip.setFromAxisAngle(new THREE.Vector3(0,1,0), Math.PI); // simple Z flip via 180° around Y
+    q.multiply(flip);
+  }
+  mountAxesGroup.setRotationFromQuaternion(q);
+}
+
+function lerp(a,b,t){ return a + (b-a)*t; }
+function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+
+function colormapTurbo(t){
+  const r = 34.61 + t*(1172.33 + t*(-10793.56 + t*(33300.12 + t*(-38394.49 + 14825.05*t))));
+  const g = 23.31 + t*(557.33  + t*(-1225.33  + t*(651.04    + t*(3172.05   - 2774.82*t))));
+  const b = 27.2  + t*(3211.1  + t*(-15327.97 + t*(27814.0   + t*(-22569.18 + 6838.66*t))));
+  return [clamp01(r/255), clamp01(g/255), clamp01(b/255)];
+}
+
+function recolor(){
+  if (!lastPositions) return;
+  const n = lastPositions.length / 3;
+  const colors = new Float32Array(n*3);
+
+  const mode = colorBySel.value;
+  const v0 = parseFloat(minVal.value);
+  const v1 = parseFloat(maxVal.value);
+
+  if (mode === 'rgb' && lastRGB && lastRGB.length === n*3){
+    geom.setAttribute("color", new THREE.BufferAttribute(lastRGB, 3));
+    geom.attributes.color.needsUpdate = true;
+    return;
+  }
+
+  if (mode === 'height'){
+    const zRange = (zMax - zMin) || 1;
+    for (let i=0;i<n;i++){
+      const z = lastPositions[i*3+2];
+      const norm = clamp01((z - zMin) / zRange);
+      const t = clamp01((norm - v0) / Math.max(1e-6, (v1 - v0)));
+      const [r,g,b] = colormapTurbo(t);
+      colors[i*3+0]=r; colors[i*3+1]=g; colors[i*3+2]=b;
+    }
+  } else {
+    const iRange = (IMax - IMin) || 1;
+    for (let i=0;i<n;i++){
+      const I = lastIntensity ? lastIntensity[i] : 0.5;
+      const norm = clamp01((I - IMin) / iRange);
+      const t = clamp01((norm - v0) / Math.max(1e-6, (v1 - v0)));
+      const [r,g,b] = colormapTurbo(t);
+      colors[i*3+0]=r; colors[i*3+1]=g; colors[i*3+2]=b;
+    }
+  }
+
+  geom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  geom.attributes.color.needsUpdate = true;
+}
+
+function updateRanges(){
+  if (!lastPositions) return;
+  const n = lastPositions.length/3;
+  zMin = +Infinity; zMax = -Infinity;
+  for (let i=0;i<n;i++){
+    const z = lastPositions[i*3+2];
+    if (z<zMin) zMin=z;
+    if (z>zMax) zMax=z;
+  }
+  if (lastIntensity){
+    IMin = +Infinity; IMax = -Infinity;
+    for (let i=0;i<lastIntensity.length;i++){
+      const I = lastIntensity[i];
+      if (I<IMin) IMin=I;
+      if (I>IMax) IMax=I;
+    }
+  } else { IMin=0; IMax=1; }
+  minVal.value = "0"; maxVal.value = "1";
+  vmin.textContent = "0.00"; vmax.textContent = "1.00";
+}
+
+function createBoundingBox(obj) {
+  // Create wireframe bounding box
+  const geometry = new THREE.BufferGeometry();
+  const corners = new Float32Array(obj.bbox_corners);
+  
+  // Define edges connecting the 8 corners
+  const indices = new Uint16Array([
+    // Bottom face
+    0,1, 1,2, 2,3, 3,0,
+    // Top face  
+    4,5, 5,6, 6,7, 7,4,
+    // Vertical edges
+    0,4, 1,5, 2,6, 3,7
+  ]);
+  
+  geometry.setAttribute('position', new THREE.BufferAttribute(corners, 3));
+  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+  
+  // Color based on object confidence
+  const color = new THREE.Color();
+  color.setHSL(obj.confidence * 0.3, 1.0, 0.5); // Red to green based on confidence
+  
+  const material = new THREE.LineBasicMaterial({ 
+    color: color,
+    linewidth: 2
+  });
+  
+  return new THREE.LineSegments(geometry, material);
+}
+
+function createObjectLabel(obj) {
+  const labelDiv = document.createElement('div');
+  labelDiv.className = 'object-label';
+  labelDiv.style.color = '#ffffff';
+  labelDiv.style.fontSize = '12px';
+  labelDiv.style.background = 'rgba(0,0,0,0.7)';
+  labelDiv.style.padding = '2px 4px';
+  labelDiv.style.borderRadius = '3px';
+  labelDiv.style.border = '1px solid #4fc3f7';
+  
+  labelDiv.innerHTML = `
+    <div style="font-weight: bold;">Object ${obj.object_id}</div>
+    <div>Vol: ${obj.volume.toFixed(3)} m³</div>
+    <div>Dist: ${obj.distance.toFixed(1)} m</div>
+  `;
+  
+  const label = new CSS2DObject(labelDiv);
+  label.position.set(obj.center_x, obj.center_y, obj.center_z + obj.depth/2 + 0.2);
+  
+  return label;
+}
+
+function createAOIVisualization(config) {
+  aoiGroup.clear();
+  
+  if (config.enable_aoi) {
+    // Create rectangular AOI bounds
+    const geometry = new THREE.BoxGeometry(
+      config.aoi_max_x - config.aoi_min_x,
+      config.aoi_max_y - config.aoi_min_y,
+      config.aoi_max_z - config.aoi_min_z
+    );
+    
+    const material = new THREE.MeshBasicMaterial({
+      color: 0x00ff00,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.3
+    });
+    
+    const aoiBox = new THREE.Mesh(geometry, material);
+    aoiBox.position.set(
+      (config.aoi_min_x + config.aoi_max_x) / 2,
+      (config.aoi_min_y + config.aoi_max_y) / 2,
+      (config.aoi_min_z + config.aoi_max_z) / 2
+    );
+    
+    aoiGroup.add(aoiBox);
+  }
+  
+  if (config.enable_radial_filter) {
+    // Create radial filter visualization (sector)
+    const minRange = config.radial_min_range;
+    const maxRange = config.radial_max_range;
+    const minAngle = config.radial_min_angle * Math.PI / 180;
+    const maxAngle = config.radial_max_angle * Math.PI / 180;
+    
+    // Create sector geometry
+    const sectorGeometry = new THREE.RingGeometry(minRange, maxRange, 32, 1, minAngle, maxAngle - minAngle);
+    const sectorMaterial = new THREE.MeshBasicMaterial({
+      color: 0x0088ff,
+      transparent: true,
+      opacity: 0.2,
+      side: THREE.DoubleSide
+    });
+    
+    const sector = new THREE.Mesh(sectorGeometry, sectorMaterial);
+    sector.rotation.x = -Math.PI / 2; // Rotate to horizontal plane
+    aoiGroup.add(sector);
+    
+    // Add range circles
+    const innerCircle = new THREE.RingGeometry(minRange - 0.05, minRange + 0.05, 64);
+    const outerCircle = new THREE.RingGeometry(maxRange - 0.05, maxRange + 0.05, 64);
+    const circleMaterial = new THREE.MeshBasicMaterial({ color: 0x0088ff, transparent: true, opacity: 0.8 });
+    
+    const innerRing = new THREE.Mesh(innerCircle, circleMaterial);
+    const outerRing = new THREE.Mesh(outerCircle, circleMaterial);
+    innerRing.rotation.x = -Math.PI / 2;
+    outerRing.rotation.x = -Math.PI / 2;
+    
+    aoiGroup.add(innerRing);
+    aoiGroup.add(outerRing);
+  }
+}
+
+function updateObjectVisualization(objects) {
+  // Clear existing objects
+  objectGroup.clear();
+  labelGroup.clear();
+  
+  lastObjects = objects;
+  
+  objects.forEach(obj => {
+    // Create bounding box
+    const bbox = createBoundingBox(obj);
+    objectGroup.add(bbox);
+    
+    // Create label
+    if (showLabels.checked) {
+      const label = createObjectLabel(obj);
+      labelGroup.add(label);
+    }
+  });
+  
+  updateObjectList(objects);
+}
+
+function updateObjectList(objects) {
+  if (objects.length === 0) {
+    objectListEl.innerHTML = 'No objects detected';
+    return;
+  }
+  
+  const sortedObjects = [...objects].sort((a, b) => a.distance - b.distance);
+  
+  objectListEl.innerHTML = sortedObjects.map(obj => `
+    <div class="object-item">
+      <div class="object-header">Object ${obj.object_id}</div>
+      <div>Position: (${obj.center_x.toFixed(2)}, ${obj.center_y.toFixed(2)}, ${obj.center_z.toFixed(2)})</div>
+      <div>Size: ${obj.width.toFixed(2)} × ${obj.height.toFixed(2)} × ${obj.depth.toFixed(2)} m</div>
+      <div>Volume: ${obj.volume.toFixed(3)} m³</div>
+      <div>Distance: ${obj.distance.toFixed(1)} m</div>
+      <div>Confidence: ${(obj.confidence * 100).toFixed(0)}%</div>
+      <div>Points: ${obj.point_count}</div>
+    </div>
+  `).join('');
+}
+
+function updateStats(frameId, timestamp, objectCount, pointCount, imuState) {
+  frameIdEl.textContent = frameId;
+  objectCountEl.textContent = objectCount;
+  pointCountEl.textContent = pointCount;
+  
+  // Update IMU status
+  if (imuState) {
+    imuStatusEl.textContent = imuState.calibrated ? 'Calibrated' : 'Calibrating...';
+    imuStatusEl.style.color = imuState.calibrated ? '#4caf50' : '#ff9800';
+    
+    motionStatusEl.textContent = imuState.stationary ? 'Stationary' : 'Moving';
+    motionStatusEl.style.color = imuState.stationary ? '#4caf50' : '#f44336';
+    
+    gravityVectorEl.textContent = `(${imuState.gravity.x.toFixed(2)}, ${imuState.gravity.y.toFixed(2)}, ${imuState.gravity.z.toFixed(2)})`;
+
+    // Orientation (RPY) derived from quaternion
+    try {
+      const q = new THREE.Quaternion(
+        imuState.orientation.x,
+        imuState.orientation.y,
+        imuState.orientation.z,
+        imuState.orientation.w
+      );
+      const e = new THREE.Euler().setFromQuaternion(q, 'ZYX');
+      const rad2deg = 180 / Math.PI;
+      const roll  = (e.x * rad2deg);
+      const pitch = (e.y * rad2deg);
+      const yaw   = (e.z * rad2deg);
+      orientationRPYEl.textContent = `${roll.toFixed(1)}, ${pitch.toFixed(1)}, ${yaw.toFixed(1)}`;
+    } catch {}
+
+    // Tilt angle relative to +Z (up), so upright (gz>0) ~ 0°
+    const gx = imuState.gravity.x, gy = imuState.gravity.y, gz = imuState.gravity.z;
+    const gnorm = Math.hypot(gx, gy, gz);
+    if (gnorm > 1e-6) {
+      let cosTheta = (gz / gnorm); // dot(g_norm, +Z)
+      cosTheta = Math.max(-1, Math.min(1, cosTheta));
+      const tiltDeg = Math.acos(cosTheta) * (180/Math.PI);
+      tiltEl.textContent = tiltDeg.toFixed(1);
+    }
+  }
+  
+  // Calculate FPS
+  const now = Date.now();
+  const dt = now - lastFrameTime;
+  if (dt > 0) {
+    const fps = 1000 / dt;
+    fpsEl.textContent = fps.toFixed(1);
+  }
+  lastFrameTime = now;
+}
+
+// Build WS URL
+const params = new URLSearchParams(window.location.search);
+let wsUrl = params.get('ws');
+if (!wsUrl) {
+  const port = params.get('port') || '8081';
+  const host = location.hostname || 'localhost';
+  wsUrl = `ws://${host}:${port}`;
+}
+
+const ws = new WebSocket(wsUrl);
+ws.binaryType = "arraybuffer";
+ws.onopen = ()=> wsEl.textContent=`connected: ${wsUrl}`;
+ws.onclose= ()=> wsEl.textContent="closed";
+ws.onerror= ()=> wsEl.textContent="error";
+
+ws.onmessage = (ev) => {
+  const buf = ev.data;
+  const dv = new DataView(buf);
+  
+  if (dv.byteLength < 58) return; // Minimum header size with IMU + ground count (app header = 58 bytes)
+  
+  // Parse header
+  const frameId = dv.getUint32(0, true);
+  const timestamp = dv.getFloat64(4, true);
+  const numObjects = dv.getUint32(12, true);
+  const numPoints = dv.getUint32(16, true);
+  const numGround = dv.getUint32(20, true);
+  
+  // Parse IMU state
+  const imuState = {
+    calibrated: dv.getUint8(24) === 1,
+    stationary: dv.getUint8(25) === 1,
+    gravity: {
+      x: dv.getFloat32(26, true),
+      y: dv.getFloat32(30, true),
+      z: dv.getFloat32(34, true)
+    },
+    motion_magnitude: dv.getFloat32(38, true),
+    orientation: {
+      w: dv.getFloat32(42, true),
+      x: dv.getFloat32(46, true),
+      y: dv.getFloat32(50, true),
+      z: dv.getFloat32(54, true)
+    }
+  };
+  
+  let offset = 58; // After extended header with numGround
+
+  // Optional size expectation (tolerant check)
+  const perObjFixed = 44; // 9 floats + 2 int32
+  const perObjBBox = 24 * 4; // 24 float32
+  const perPoint = 16; // x,y,z,I
+  const expectedMin = 58 + numObjects * (perObjFixed + perObjBBox) + (numGround + numPoints) * perPoint;
+  // If packet shorter than expected, we'll parse what we can; just a hint for debugging
+  
+  // Parse objects
+  const objects = [];
+  const objectSize = 44; // 9 floats + 2 int32
+  
+  for (let i = 0; i < numObjects; i++) {
+    if (offset + objectSize > dv.byteLength) break;
+    
+    const obj = {
+      center_x: dv.getFloat32(offset, true),
+      center_y: dv.getFloat32(offset + 4, true),
+      center_z: dv.getFloat32(offset + 8, true),
+      width: dv.getFloat32(offset + 12, true),
+      height: dv.getFloat32(offset + 16, true),
+      depth: dv.getFloat32(offset + 20, true),
+      volume: dv.getFloat32(offset + 24, true),
+      distance: dv.getFloat32(offset + 28, true),
+      confidence: dv.getFloat32(offset + 32, true),
+      point_count: dv.getInt32(offset + 36, true),
+      object_id: dv.getInt32(offset + 40, true),
+      bbox_corners: []
+    };
+    
+    offset += objectSize;
+    
+    // Parse bounding box corners (24 floats)
+    for (let j = 0; j < 24; j++) {
+      if (offset + 4 > dv.byteLength) break;
+      obj.bbox_corners.push(dv.getFloat32(offset, true));
+      offset += 4;
+    }
+    
+    objects.push(obj);
+  }
+  
+  // Parse ground points first
+  const groundPos = new Float32Array(numGround * 3);
+  const groundI = new Float32Array(numGround);
+  for (let i = 0; i < numGround; i++) {
+    if (offset + perPoint > dv.byteLength) break;
+    groundPos[i * 3] = dv.getFloat32(offset, true);
+    groundPos[i * 3 + 1] = dv.getFloat32(offset + 4, true);
+    groundPos[i * 3 + 2] = dv.getFloat32(offset + 8, true);
+    groundI[i] = dv.getFloat32(offset + 12, true);
+    offset += perPoint;
+  }
+
+  // Parse non-ground point cloud data
+  const pointSize = 16; // 4 floats (x, y, z, intensity)
+  const f32pos = new Float32Array(numPoints * 3);
+  const f32intensity = new Float32Array(numPoints);
+  
+  for (let i = 0; i < numPoints; i++) {
+    if (offset + pointSize > dv.byteLength) break;
+    
+    f32pos[i * 3] = dv.getFloat32(offset, true);         // x
+    f32pos[i * 3 + 1] = dv.getFloat32(offset + 4, true); // y
+    f32pos[i * 3 + 2] = dv.getFloat32(offset + 8, true); // z
+    f32intensity[i] = dv.getFloat32(offset + 12, true);   // intensity
+    
+    offset += pointSize;
+  }
+  
+  // Update visualization
+  // Update ground geometry
+  if (numGround > 0) {
+    groundGeom.setAttribute("position", new THREE.BufferAttribute(groundPos, 3));
+    groundGeom.computeBoundingSphere();
+  } else {
+    groundGeom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(), 3));
+  }
+
+  if (numPoints > 0) {
+    lastPositions = f32pos;
+    lastIntensity = f32intensity;
+    lastRGB = null;
+    
+    geom.setAttribute("position", new THREE.BufferAttribute(f32pos, 3));
+    geom.computeBoundingSphere();
+    
+    updateRanges();
+    recolor();
+  }
+  
+  // Update IMU axes orientation
+  if (showIMUAxes.checked) {
+    const q = new THREE.Quaternion(
+      imuState.orientation.x,
+      imuState.orientation.y,
+      imuState.orientation.z,
+      imuState.orientation.w
+    );
+    imuAxesGroup.setRotationFromQuaternion(q);
+  }
+
+  // Update gravity axes orientation (Z aligned to +Z up w.r.t gravity)
+  if (showGravityAxes.checked) {
+    const gx = imuState.gravity.x, gy = imuState.gravity.y, gz = imuState.gravity.z;
+    const g = new THREE.Vector3(gx, gy, gz);
+    if (g.length() > 1e-6) {
+      const zUp = g.clone().normalize(); // +gravity as up (matching tilt convention above)
+      const xAxis = new THREE.Vector3(1,0,0);
+      // ensure x not parallel to zUp
+      const xProj = xAxis.clone().sub(zUp.clone().multiplyScalar(xAxis.dot(zUp)));
+      const x = xProj.length() > 1e-3 ? xProj.normalize() : new THREE.Vector3(0,1,0);
+      const y = new THREE.Vector3().crossVectors(zUp, x).normalize();
+      const m = new THREE.Matrix4().makeBasis(x, y, zUp);
+      const qg = new THREE.Quaternion().setFromRotationMatrix(m);
+      gravityAxesGroup.setRotationFromQuaternion(qg);
+    }
+  }
+
+  // Throttled IMU console log (RPY, tilt)
+  {
+    const nowMs = Date.now();
+    if (nowMs - lastImuLogTime >= 1000) {
+      lastImuLogTime = nowMs;
+      try {
+        const q = new THREE.Quaternion(
+          imuState.orientation.x,
+          imuState.orientation.y,
+          imuState.orientation.z,
+          imuState.orientation.w
+        );
+        const e = new THREE.Euler().setFromQuaternion(q, 'ZYX');
+        const rad2deg = 180/Math.PI;
+        const roll  = e.x*rad2deg, pitch = e.y*rad2deg, yaw = e.z*rad2deg;
+        const gx = imuState.gravity.x, gy = imuState.gravity.y, gz = imuState.gravity.z;
+        const gnorm = Math.hypot(gx, gy, gz) || 1;
+  let cosTheta = (gz / gnorm);
+        cosTheta = Math.max(-1, Math.min(1, cosTheta));
+        const tiltDeg = Math.acos(cosTheta) * rad2deg;
+        console.log(`[IMU] RPY(deg)=${roll.toFixed(1)}, ${pitch.toFixed(1)}, ${yaw.toFixed(1)} | tilt=${tiltDeg.toFixed(1)} | grav=(${gx.toFixed(2)}, ${gy.toFixed(2)}, ${gz.toFixed(2)})`);
+      } catch {}
+    }
+  }
+  
+  updateObjectVisualization(objects);
+  // Pass the parsed timestamp along with counts to updateStats
+  updateStats(frameId, timestamp, numObjects, numPoints + numGround, imuState);
+  
+  frameCount++;
+};
+</script>
+</body>
+</html>

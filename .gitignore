@@ -1,0 +1,90 @@
+# Build directories and CMake artifacts
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Logs and generated data
+logs/
+*.log
+*.bin
+*.csv
+*.tmp
+
+# Object/archive/libs
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.lib
+
+# Node/JS artifacts (viz)
+viz/node_modules/
+viz/.next/
+viz/dist/
+viz/package-lock.json
+viz/pnpm-lock.yaml
+viz/yarn.lock
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/# Build and CMake files
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.obj
+*.so
+*.a
+*.exe
+*.dll
+*.lib
+*.bin
+*.log
+*.marks
+*.user
+*.swp
+*.swo
+*.swn
+*.bak
+*.tmp
+*.out
+
+# IDE and editor files
+.idea/
+*.code-workspace
+*.sublime-workspace
+*.sublime-project
+
+# Logs
+logs/
+*.log
+*.csv
+
+
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Misc
+*.orig
+*.rej
+
+# Third-party build artifacts
+third_party/**/build/
+third_party/**/CMakeFiles/
+third_party/**/CMakeCache.txt
+third_party/**/cmake_install.cmake
+third_party/**/Makefile
