@@ -589,13 +589,25 @@ ws.onmessage = (ev) => {
     }
   };
   
-  let offset = 58; // After extended header with numGround
-
-  // Optional size expectation (tolerant check)
+  // Decide header size: legacy 58 vs new 62 (with ground RGB 3 bytes + 1 reserved)
   const perObjFixed = 44; // 9 floats + 2 int32
   const perObjBBox = 24 * 4; // 24 float32
   const perPoint = 16; // x,y,z,I
-  const expectedMin = 58 + numObjects * (perObjFixed + perObjBBox) + (numGround + numPoints) * perPoint;
+  const expectedLegacy = 58 + numObjects * (perObjFixed + perObjBBox) + (numGround + numPoints) * perPoint;
+  const expectedNew    = 62 + numObjects * (perObjFixed + perObjBBox) + (numGround + numPoints) * perPoint;
+  let useNewHeader = false;
+  if (dv.byteLength >= expectedNew) useNewHeader = true; else if (dv.byteLength >= expectedLegacy) useNewHeader = false;
+  let groundRGB = { r: 80, g: 160, b: 255 };
+  if (useNewHeader) {
+    // Read bytes 58..60 as RGB; 61 is reserved (currently 0)
+    groundRGB.r = dv.getUint8(58);
+    groundRGB.g = dv.getUint8(59);
+    groundRGB.b = dv.getUint8(60);
+  }
+  let offset = useNewHeader ? 62 : 58; // After extended header
+
+  // Optional size expectation (tolerant check)
+  const expectedMin = (useNewHeader ? 62 : 58) + numObjects * (perObjFixed + perObjBBox) + (numGround + numPoints) * perPoint;
   // If packet shorter than expected, we'll parse what we can; just a hint for debugging
   
   // Parse objects
@@ -661,10 +673,15 @@ ws.onmessage = (ev) => {
   }
   
   // Update visualization
-  // Update ground geometry
+  // Update ground geometry and color
   if (numGround > 0) {
     groundGeom.setAttribute("position", new THREE.BufferAttribute(groundPos, 3));
     groundGeom.computeBoundingSphere();
+    if (useNewHeader) {
+      const col = new THREE.Color(groundRGB.r/255, groundRGB.g/255, groundRGB.b/255);
+      groundMat.color = col;
+      groundMat.needsUpdate = true;
+    }
   } else {
     groundGeom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(), 3));
   }

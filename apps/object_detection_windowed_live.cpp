@@ -26,7 +26,6 @@
 #include <pcl/segmentation/sac_segmentation.h>
 #include <pcl/filters/extract_indices.h>
 #include <pcl/search/kdtree.h>
-#include <pcl/segmentation/extract_clusters.h>
 #endif
 
 using namespace fastlio2;
@@ -53,6 +52,8 @@ struct RuntimeCfg {
   bool  remove_ground = true;
   float ground_threshold = 0.10f;
   bool  stream_ground_points = true;
+  // default ground color for viz (RGB 0-255)
+  uint8_t ground_color_r = 80, ground_color_g = 160, ground_color_b = 255;
   float cluster_tolerance = 0.30f;
   int   min_cluster_size = 10;
   int   max_cluster_size = 5000;
@@ -75,6 +76,14 @@ struct RuntimeCfg {
   bool  imu_rotate_points = true;
   int   ws_port = 8081;
 
+  // Simple accumulation (alternative/overlay to windowed settings)
+  // If >0, retain up to this many recent frames worth of points
+  int   accumulate_frames = 0;         
+  // If >0, retain points within this time horizon (seconds)
+  float accumulate_seconds = 0.0f;     
+  // Safety cap on total accumulated points kept in memory
+  int   max_accumulated_points = 0;    
+
   WindowCfg win;
 };
 
@@ -89,6 +98,14 @@ static RuntimeCfg load_cfg(const std::string& path){
       cfg.remove_ground = od["remove_ground"].as<bool>(cfg.remove_ground);
       cfg.ground_threshold = od["ground_threshold"].as<float>(cfg.ground_threshold);
       if (od["stream_ground_points"]) cfg.stream_ground_points = od["stream_ground_points"].as<bool>(cfg.stream_ground_points);
+      if (od["ground_color_rgb"]) {
+        auto v = od["ground_color_rgb"].as<std::vector<int>>();
+        if (v.size() == 3){
+          cfg.ground_color_r = (uint8_t)std::clamp(v[0],0,255);
+          cfg.ground_color_g = (uint8_t)std::clamp(v[1],0,255);
+          cfg.ground_color_b = (uint8_t)std::clamp(v[2],0,255);
+        }
+      }
       cfg.cluster_tolerance = od["cluster_tolerance"].as<float>(cfg.cluster_tolerance);
       cfg.min_cluster_size = od["min_cluster_size"].as<int>(cfg.min_cluster_size);
       cfg.max_cluster_size = od["max_cluster_size"].as<int>(cfg.max_cluster_size);
@@ -111,6 +128,10 @@ static RuntimeCfg load_cfg(const std::string& path){
       cfg.radial_min_angle = od["radial_min_angle"].as<float>(cfg.radial_min_angle);
       cfg.radial_max_angle = od["radial_max_angle"].as<float>(cfg.radial_max_angle);
       if (od["imu_rotate_points"]) cfg.imu_rotate_points = od["imu_rotate_points"].as<bool>(cfg.imu_rotate_points);
+      // Simple accumulation controls at object_detection level (optional)
+      if (od["accumulate_frames"]) cfg.accumulate_frames = od["accumulate_frames"].as<int>(cfg.accumulate_frames);
+      if (od["accumulate_seconds"]) cfg.accumulate_seconds = od["accumulate_seconds"].as<float>(cfg.accumulate_seconds);
+      if (od["max_accumulated_points"]) cfg.max_accumulated_points = od["max_accumulated_points"].as<int>(cfg.max_accumulated_points);
       // windowed options under object_detection.window
       if (od["window"]) {
         auto w = od["window"];
@@ -146,8 +167,11 @@ static void pack_and_send(WsServer& ws, uint32_t frame_id, double stamp,
                           const std::vector<float>& ground_xyz,
                           const std::vector<float>& ground_I,
                           const std::vector<float>& pts_xyz,
-                          const std::vector<float>& pts_I){
-  std::vector<uint8_t> buf; buf.reserve(64 + objs.size()* (44 + 24*4) + (ground_I.size()+pts_I.size())*16/1);
+                          const std::vector<float>& pts_I,
+                          uint8_t ground_r,
+                          uint8_t ground_g,
+                          uint8_t ground_b){
+  std::vector<uint8_t> buf; buf.reserve(68 + objs.size()* (44 + 24*4) + (ground_I.size()+pts_I.size())*16/1);
   append_u32(buf, frame_id); append_f64(buf, stamp);
   append_u32(buf, (uint32_t)objs.size());
   append_u32(buf, (uint32_t)pts_I.size());
@@ -156,6 +180,11 @@ static void pack_and_send(WsServer& ws, uint32_t frame_id, double stamp,
   append_f32(buf, imu.gx); append_f32(buf, imu.gy); append_f32(buf, imu.gz);
   append_f32(buf, imu.motion_mag);
   append_f32(buf, imu.qw); append_f32(buf, imu.qx); append_f32(buf, imu.qy); append_f32(buf, imu.qz);
+  // Ground RGB (3 bytes) + 1 reserved for alignment
+  buf.push_back(ground_r);
+  buf.push_back(ground_g);
+  buf.push_back(ground_b);
+  buf.push_back(0);
   for (const auto& o : objs){
     append_f32(buf,o.cx); append_f32(buf,o.cy); append_f32(buf,o.cz);
     append_f32(buf,o.w); append_f32(buf,o.h); append_f32(buf,o.d);
@@ -222,14 +251,18 @@ int main(int argc, char** argv){
   auto on_imu = [&](const ImuSample& s){ std::lock_guard<std::mutex> lk(mtx_imu); imu.gx=s.ax; imu.gy=s.ay; imu.gz=s.az; float gnorm=std::sqrt(imu.gx*imu.gx+imu.gy*imu.gy+imu.gz*imu.gz)+1e-9f; imu.stationary=(std::fabs(gnorm-9.81f)<0.5f); imu.calibrated=true; imu.qw=s.qw; imu.qx=s.qx; imu.qy=s.qy; imu.qz=s.qz; imu.motion_mag=std::fabs(gnorm-9.81f); };
 
   // Window buffers: keep a deque of points with their angle and time tags
-  struct TaggedPoint { P p; float ang_deg; double t; };
+  struct TaggedPoint { P p; float ang_deg; double t; uint32_t frm; };
   std::deque<TaggedPoint> ring;
   size_t ring_points = 0;
   // rolling window center (deg) advances each callback to sweep 360
   float rolling_center_deg = -180.0f;
+  // local frame counter for accumulation by frames
+  uint32_t local_frame_counter = 0;
 
   auto on_lidar = [&](const LidarFrame& f){
 #ifdef FASTLIO2_USE_PCL
+    // Increment local frame id for accumulation gating
+    const uint32_t this_frame = local_frame_counter++;
     // Convert and tag
     ImuState imu_copy; { std::lock_guard<std::mutex> lk(mtx_imu); imu_copy = imu; }
     float qw=imu_copy.qw, qx=imu_copy.qx, qy=imu_copy.qy, qz=imu_copy.qz; float nq=std::sqrt(qw*qw+qx*qx+qy*qy+qz*qz); if(nq>1e-6f){qw/=nq;qx/=nq;qy/=nq;qz/=nq;} else {qw=1;qx=qy=qz=0;}
@@ -244,20 +277,32 @@ int main(int argc, char** argv){
       if (cfg.enable_radial_filter){ float r=std::sqrt(p.x*p.x+p.y*p.y); if (r<cfg.radial_min_range||r>cfg.radial_max_range) continue; float ang=std::atan2(p.y,p.x); float ang_min=cfg.radial_min_angle*(float)M_PI/180.f, ang_max=cfg.radial_max_angle*(float)M_PI/180.f; if(ang<ang_min||ang>ang_max) continue; }
       if (point_range(p) > cfg.max_detection_range) continue;
       float ang_deg = atan2_deg(p.y, p.x);
-      TaggedPoint tp{p, ang_deg, f.t0 + pt.t_rel};
+      TaggedPoint tp{p, ang_deg, f.t0 + pt.t_rel, this_frame};
       ring.push_back(tp); ring_points++;
-      while ((int)ring_points > cfg.win.max_points){ ring.pop_front(); ring_points--; }
+      // Immediate hard cap by max points to avoid growth
+      int eff_max_points = cfg.max_accumulated_points > 0 ? cfg.max_accumulated_points : cfg.win.max_points;
+      while ((int)ring_points > eff_max_points){ ring.pop_front(); ring_points--; }
     }
 
-    // Evict old by time window + overlap
-    if (cfg.win.enable_time_window){
-      const double keep_from = f.t1 - (cfg.win.window_time_s + cfg.win.window_overlap_s);
+    // Evict old by time horizon if configured
+    double eff_seconds = 0.0;
+    if (cfg.accumulate_seconds > 0.0f) eff_seconds = cfg.accumulate_seconds;
+    else if (cfg.win.enable_time_window) eff_seconds = (cfg.win.window_time_s + cfg.win.window_overlap_s);
+    if (eff_seconds > 0.0){
+      const double keep_from = f.t1 - eff_seconds;
       while(!ring.empty() && ring.front().t < keep_from){ ring.pop_front(); ring_points--; }
+    }
+
+    // Evict old by frame count if configured
+    if (cfg.accumulate_frames > 0){
+      const uint32_t min_keep_frame = (this_frame >= (uint32_t)(cfg.accumulate_frames - 1)) ? (this_frame - (uint32_t)(cfg.accumulate_frames - 1)) : 0u;
+      while(!ring.empty() && ring.front().frm < min_keep_frame){ ring.pop_front(); ring_points--; }
     }
 
     // Build current selection over full 360° using overlapping angular windows and time guards
     std::vector<P> window_points; window_points.reserve(std::min<size_t>(ring_points * 2, (size_t)cfg.win.max_points * 2));
-    const double time_keep_from = cfg.win.enable_time_window ? (f.t1 - (cfg.win.window_time_s + cfg.win.window_overlap_s)) : -std::numeric_limits<double>::infinity();
+    double time_keep_from = -std::numeric_limits<double>::infinity();
+    if (eff_seconds > 0.0) time_keep_from = f.t1 - eff_seconds;
 
     const bool use_angle = cfg.win.enable_angle_window && (cfg.win.window_width_deg < 359.0f);
     if (use_angle){
@@ -289,26 +334,14 @@ int main(int argc, char** argv){
     pcl::PointCloud<P>::Ptr nonground(new pcl::PointCloud<P>()); pcl::PointCloud<P>::Ptr ground(new pcl::PointCloud<P>());
     if (cfg.remove_ground && cloud->size() >= 50){ pcl::SACSegmentation<P> seg; seg.setOptimizeCoefficients(true); seg.setModelType(pcl::SACMODEL_PLANE); seg.setMethodType(pcl::SAC_RANSAC); seg.setDistanceThreshold(cfg.ground_threshold); seg.setMaxIterations(100); seg.setInputCloud(cloud); pcl::ModelCoefficients coeff; pcl::PointIndices::Ptr inliers(new pcl::PointIndices()); seg.segment(*inliers, coeff); if(!inliers->indices.empty()){ pcl::ExtractIndices<P> ex; ex.setInputCloud(cloud); ex.setIndices(inliers); ex.setNegative(true); ex.filter(*nonground); ex.setNegative(false); ex.filter(*ground);} else { *nonground = *cloud; } } else { *nonground = *cloud; }
 
-    // Clustering
+    // Clustering: use DBSCAN only
     std::vector<pcl::PointIndices> clusters;
     if (!nonground->empty()){
-      if (cfg.clustering_method == "dbscan"){
-        dbscan(nonground, cfg.dbscan_eps, cfg.dbscan_min_points, clusters);
-        if (cfg.max_cluster_size > 0){
-          std::vector<pcl::PointIndices> filtered; filtered.reserve(clusters.size());
-          for (auto &c : clusters) if ((int)c.indices.size() >= cfg.min_cluster_size && (int)c.indices.size() <= cfg.max_cluster_size) filtered.push_back(std::move(c));
-          clusters.swap(filtered);
-        }
-      } else {
-        pcl::search::KdTree<P>::Ptr tree(new pcl::search::KdTree<P>());
-        tree->setInputCloud(nonground);
-        pcl::EuclideanClusterExtraction<P> ec;
-        ec.setClusterTolerance(cfg.cluster_tolerance);
-        ec.setMinClusterSize(cfg.min_cluster_size);
-        ec.setMaxClusterSize(cfg.max_cluster_size);
-        ec.setSearchMethod(tree);
-        ec.setInputCloud(nonground);
-        ec.extract(clusters);
+      dbscan(nonground, cfg.dbscan_eps, cfg.dbscan_min_points, clusters);
+      if (cfg.max_cluster_size > 0){
+        std::vector<pcl::PointIndices> filtered; filtered.reserve(clusters.size());
+        for (auto &c : clusters) if ((int)c.indices.size() >= cfg.min_cluster_size && (int)c.indices.size() <= cfg.max_cluster_size) filtered.push_back(std::move(c));
+        clusters.swap(filtered);
       }
     }
 
@@ -319,7 +352,8 @@ int main(int argc, char** argv){
     std::vector<float> ground_xyz; std::vector<float> ground_I; if(cfg.stream_ground_points && ground){ ground_xyz.reserve(ground->size()*3); ground_I.reserve(ground->size()); for(const auto& p:*ground){ ground_xyz.push_back(p.x); ground_xyz.push_back(p.y); ground_xyz.push_back(p.z); ground_I.push_back(p.intensity);} }
     std::vector<float> pts_xyz; pts_xyz.reserve(nonground->size()*3); std::vector<float> pts_I; pts_I.reserve(nonground->size()); for(const auto& p:*nonground){ pts_xyz.push_back(p.x); pts_xyz.push_back(p.y); pts_xyz.push_back(p.z); pts_I.push_back(p.intensity);} 
 
-    pack_and_send(ws, frame_id.fetch_add(1), f.t1, imu_copy, out_objs, ground_xyz, ground_I, pts_xyz, pts_I);
+    pack_and_send(ws, frame_id.fetch_add(1), f.t1, imu_copy, out_objs, ground_xyz, ground_I, pts_xyz, pts_I,
+                  cfg.ground_color_r, cfg.ground_color_g, cfg.ground_color_b);
 #endif
   };
 

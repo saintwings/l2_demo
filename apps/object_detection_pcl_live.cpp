@@ -162,9 +162,12 @@ static void pack_and_send(WsServer& ws, uint32_t frame_id, double stamp,
                           const std::vector<float>& ground_xyz,
                           const std::vector<float>& ground_I,
                           const std::vector<float>& pts_xyz,
-                          const std::vector<float>& pts_I){
+                          const std::vector<float>& pts_I,
+                          uint8_t ground_r,
+                          uint8_t ground_g,
+                          uint8_t ground_b){
   // Header size grows by 4 bytes for numGroundPoints
-  std::vector<uint8_t> buf; buf.reserve(58 + objs.size()* (44 + 24*4) + (ground_I.size()+pts_I.size())*16/1);
+  std::vector<uint8_t> buf; buf.reserve(62 + objs.size()* (44 + 24*4) + (ground_I.size()+pts_I.size())*16/1);
   // Header
   append_u32(buf, frame_id);
   append_f64(buf, stamp);
@@ -178,6 +181,11 @@ static void pack_and_send(WsServer& ws, uint32_t frame_id, double stamp,
   append_f32(buf, imu.motion_mag);
   // orientation w,x,y,z
   append_f32(buf, imu.qw); append_f32(buf, imu.qx); append_f32(buf, imu.qy); append_f32(buf, imu.qz);
+  // Ground RGB (3 bytes) + 1 reserved for alignment
+  buf.push_back(ground_r);
+  buf.push_back(ground_g);
+  buf.push_back(ground_b);
+  buf.push_back(0);
 
   // Objects
   for (const auto& o : objs){
@@ -540,7 +548,8 @@ int main(int argc, char** argv){
     for (const auto& p : *nonground){ pts_xyz.push_back(p.x); pts_xyz.push_back(p.y); pts_xyz.push_back(p.z); pts_I.push_back(p.intensity); }
 
   // imu_copy already made above
-  pack_and_send(ws, frame_id.fetch_add(1), f.t1, imu_copy, out_objs, ground_xyz, ground_I, pts_xyz, pts_I);
+  pack_and_send(ws, frame_id.fetch_add(1), f.t1, imu_copy, out_objs, ground_xyz, ground_I, pts_xyz, pts_I,
+                cfg.ground_color_r, cfg.ground_color_g, cfg.ground_color_b);
 #else
     (void)f; // if PCL disabled
 #endif
