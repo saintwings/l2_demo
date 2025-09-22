@@ -37,6 +37,7 @@
   <label><input type="checkbox" id="showIMUAxes" checked> Show IMU Axes</label><br/>
   <label><input type="checkbox" id="showGravityAxes"> Show Gravity Axes</label><br/>
   <label><input type="checkbox" id="showMountAxes"> Show Mount Axes</label><br/>
+  <label><input type="checkbox" id="rotateScene"> Rotate Scene 180°</label><br/>
   
   <div id="pointCloudControls">
     Color By:
@@ -164,6 +165,7 @@ const showAOI = document.getElementById('showAOI');
 const showIMUAxes = document.getElementById('showIMUAxes');
 const showGravityAxes = document.getElementById('showGravityAxes');
 const showMountAxes = document.getElementById('showMountAxes');
+const rotateScene = document.getElementById('rotateScene');
 const frameIdEl = document.getElementById('frameId');
 const objectCountEl = document.getElementById('objectCount');
 const pointCountEl = document.getElementById('pointCount');
@@ -188,6 +190,13 @@ showAOI.onchange = () => { aoiGroup.visible = showAOI.checked; };
 showIMUAxes.onchange = () => { imuAxesGroup.visible = showIMUAxes.checked; };
 showGravityAxes.onchange = () => { gravityAxesGroup.visible = showGravityAxes.checked; };
 showMountAxes.onchange = () => { mountAxesGroup.visible = showMountAxes.checked; };
+rotateScene.onchange = () => { 
+  if (rotateScene.checked) {
+    scene.rotation.x = -Math.PI / 2 + Math.PI; // Original rotation + 180°
+  } else {
+    scene.rotation.x = -Math.PI / 2; // Original rotation
+  }
+};
 
 window.addEventListener("resize", () => {
   camera.aspect = innerWidth/innerHeight;
