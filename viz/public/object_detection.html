@@ -95,6 +95,7 @@ document.body.appendChild(labelRenderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0f14);
 scene.rotation.x = -Math.PI /2;
+scene.rotation.z = -Math.PI;
 
 const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 2000);
 camera.position.set(6, 6, 6);
